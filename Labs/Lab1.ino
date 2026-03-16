@@ -1,3 +1,13 @@
+/*
+ * Lab1.ino
+ *
+ * Enter the Robotics Lab Mechatronics Arena with a 
+ * 90 degree angle and traversing the course from one
+ * entrance to another in a straight line while
+ * hitting and subsequently dragging an obstacle in the
+ * middle of the arena to the exit
+ */
+
 #include <Arduino.h>
 
 /* ===================== Pins (Raspberry Pi Pico + L298N) ===================== */
