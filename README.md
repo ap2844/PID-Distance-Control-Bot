@@ -25,5 +25,3 @@ The system also includes braking during direction changes, reverse kick-start ha
 - DC motors with encoders
 - Power supply
 - Robot chassis
-
-## Structure
