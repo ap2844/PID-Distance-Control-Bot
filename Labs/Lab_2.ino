@@ -1,14 +1,27 @@
+/*
+ * Lab1.ino
+ *
+ * Enter the Robotics Lab Mechatronics Arena with a 
+ * 90 degree angle and traversing the course from one
+ * entrance to another in a straight line while
+ * hitting and subsequently dragging an obstacle in the
+ * middle of the arena to the exit
+ */
+
 #include <Arduino.h>
 
 /* ===================== Pins (Raspberry Pi Pico + L298N) ===================== */
-#define ENA 0
-#define ENB 1
-#define IN1 3
-#define IN2 2
-#define IN3 5
-#define IN4 4
-#define ENC_L_A 7
-#define ENC_L_B 6
+// ===== Motor pins =====
+#define ENA 14
+#define ENB 15
+#define IN1 4
+#define IN2 5
+#define IN3 2
+#define IN4 3
+
+// ===== Encoder pins =====
+#define ENC_L_A 6
+#define ENC_L_B 7
 #define ENC_R_A 17
 #define ENC_R_B 16
 
@@ -20,9 +33,9 @@ inline float ticksPerMeter(){ return (float)TICKS_PER_REV / (PI * WHEEL_DIAMETER
 
 /* =============================== Tuning =============================== */
 /* Feed-forward split: start stronger side lower and weaker higher */
-int   BASE_L      = 255;   // left base PWM
-int   BASE_R      = 255;   // right base PWM
-int   MIN_PWM     = 150;   // floor to avoid stall
+int   BASE_L      = 200;   // left base PWM
+int   BASE_R      = 200;   // right base PWM
+int   MIN_PWM     = 180;   // floor to avoid stall
 
 /* Controller timing & logging */
 int   CTRL_DT_MS  = 15;    // control loop tick
@@ -30,9 +43,9 @@ int   PRINT_MS    = 100;   // debug cadence
 #define DEBUG 1
 
 /* Ratio controller: balance = K_RATIO * (|dR5|/|dL5| - 1), clamped */
-float K_RATIO     = 130.0f; // shove per 1.0 relative error
-float REL_CLAMP   = 0.20f;  // cap ratio error to ±20%
-int   BAL_CLAMP   = 30;     // cap balance PWM to ±30
+float K_RATIO     = 150.0f; // shove per 1.0 relative error
+float REL_CLAMP   = 0.01f;  // cap ratio error to ±20%
+int   BAL_CLAMP   = 20;     // cap balance PWM to ±30
 
 /* Moving average window (smoothing) */
 const int MA_N    = 5;
@@ -48,19 +61,15 @@ int RAM_KICK_PWM  = 175;
 int RAM_KICK_MS   = 45;
 
 /* Distance/turn correction knobs */
-float DIST_CORR = 0.650f;
-float TURN_CORR = 1.000f;
+float DIST_CORR = 0.725f;
+float TURN_CORR = 0.850f;
 
 /* ===== Simultaneous start gate ===== */
-int   START_KICK_PWM     = 255;   // initial shove to overcome static friction
-int   START_HOLD_PWM     = 150;   // keep already-moving side slow while waiting
-int   START_MAX_WAIT_MS  = 300;   // overall wait guard
-int   START_WINDOW_MS    = 10;    // check cadence during start gate
-long  START_TICKS_THRESH = 1;     // ticks that count as "started"
-
-/* ===== Electrical braking ===== */
-int BRAKE_PWM = 255;   // full brake pulse
-int BRAKE_MS  = 160;    // adjust 40–120 ms as needed
+int   START_KICK_PWM     = 200;   // initial shove to overcome static friction
+int   START_HOLD_PWM     = 160;   // keep already-moving side slow while waiting
+int   START_MAX_WAIT_MS  = 600;   // overall wait guard
+int   START_WINDOW_MS    = 25;    // check cadence during start gate
+long  START_TICKS_THRESH = 3;     // ticks that count as "started"
 
 /* =============================== State =============================== */
 volatile long encL=0, encR=0;
@@ -87,31 +96,7 @@ long getCountR(){ long v=getRawR(); return ENCODER_INV_RIGHT? -v : v; }
 void setDirLeft(bool f){ bool d=f ^ MOTOR_INV_LEFT;  digitalWrite(IN1,d?HIGH:LOW); digitalWrite(IN2,d?LOW:HIGH); }
 void setDirRight(bool f){ bool d=f ^ MOTOR_INV_RIGHT; digitalWrite(IN3,d?HIGH:LOW); digitalWrite(IN4,d?LOW:HIGH); }
 void setPWM(int l, int r){ analogWrite(ENA,clamp255(l)); analogWrite(ENB,clamp255(r)); }
-
-void stopMotors(){
-  analogWrite(ENA,0);
-  analogWrite(ENB,0);
-  digitalWrite(IN1,LOW);
-  digitalWrite(IN2,LOW);
-  digitalWrite(IN3,LOW);
-  digitalWrite(IN4,LOW);
-}
-
-void electricalBrake(int brakePWM = BRAKE_PWM, int brakeMs = BRAKE_MS){
-  brakePWM = clamp255(brakePWM);
-
-  // Dynamic brake: both terminals of each motor forced to same state
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, HIGH);
-
-  analogWrite(ENA, brakePWM);
-  analogWrite(ENB, brakePWM);
-  delay(brakeMs);
-
-  stopMotors();
-}
+void stopMotors(){ analogWrite(ENA,0); analogWrite(ENB,0); digitalWrite(IN1,LOW); digitalWrite(IN2,LOW); digitalWrite(IN3,LOW); digitalWrite(IN4,LOW); }
 
 /* ==================== One-time motor/encoder polarity probe ================= */
 void autoConfigure(){
@@ -155,7 +140,7 @@ void ensureBothEncodersStarted(bool forward){
 
   while(true){
     unsigned long now = millis();
-    if(now - t0 > (unsigned long)START_MAX_WAIT_MS) break;
+    if(now - t0 > (unsigned long)START_MAX_WAIT_MS) break; // guard against stalling forever
 
     long dL = labs(getCountL() - L0);
     long dR = labs(getCountR() - R0);
@@ -164,12 +149,14 @@ void ensureBothEncodersStarted(bool forward){
 
     if(lStarted && rStarted) break;
 
+    // If one started and the other hasn't, favour the stuck side
     if(!lStarted && rStarted){
-      setPWM(START_KICK_PWM, START_HOLD_PWM);   // push left, hold right
+      setPWM(START_KICK_PWM, START_HOLD_PWM);     // push left, hold right slow
     } else if(lStarted && !rStarted){
-      setPWM(START_HOLD_PWM, START_KICK_PWM);   // hold left, push right
+      setPWM(START_HOLD_PWM, START_KICK_PWM);     // hold left slow, push right
     } else {
-      setPWM(START_KICK_PWM, START_KICK_PWM);   // neither started yet
+      // neither started yet — keep kicking both
+      setPWM(START_KICK_PWM, START_KICK_PWM);
     }
 
     delay(START_WINDOW_MS);
@@ -179,6 +166,7 @@ void ensureBothEncodersStarted(bool forward){
 /* =================== Core straight controller (ratio MA) =================== */
 /* Drives forward/backward until 'avg ticks' reaches target. */
 void driveStraightToTicks(long targetTicksAbs, bool forward){
+  // NEW: make sure both wheels actually begin moving together
   ensureBothEncodersStarted(forward);
 
   setDirLeft(forward);
@@ -202,6 +190,7 @@ void driveStraightToTicks(long targetTicksAbs, bool forward){
     long dL=L-lastL, dR=R-lastR;
     lastL=L; lastR=R;
 
+    // moving average (on deltas)
     sumL -= bufL[idx]; sumR -= bufR[idx];
     bufL[idx]=dL;      bufR[idx]=dR;
     sumL += bufL[idx]; sumR += bufR[idx];
@@ -213,9 +202,9 @@ void driveStraightToTicks(long targetTicksAbs, bool forward){
 
     float rel;
     if (aL==0.0f && aR==0.0f) rel=0.0f;
-    else if (aL==0.0f)        rel= REL_CLAMP;
+    else if (aL==0.0f)        rel= REL_CLAMP;         // right moved, left didn’t
     else {
-      rel = (aR / aL) - 1.0f;
+      rel = (aR / aL) - 1.0f;                         // >0: right faster
       if(rel >  REL_CLAMP) rel =  REL_CLAMP;
       if(rel < -REL_CLAMP) rel = -REL_CLAMP;
     }
@@ -252,8 +241,7 @@ void driveStraightToTicks(long targetTicksAbs, bool forward){
     long done  = (doneL + doneR)/2;
     if (done >= targetTicksAbs) break;
   }
-
-  electricalBrake();
+  stopMotors();
 }
 
 /* Convenience: meters forward(+)/back(-) using the ratio controller */
@@ -267,19 +255,21 @@ void driveMeters(float meters){
 
 /* ===================== Turn in place (deg>0=CCW, <0=CW) ===================== */
 void turnInPlace(float deg){
-  float arc_m = (PI * WHEEL_BASE_M) * (fabs(deg) / 360.0f);
+  float arc_m = (PI * WHEEL_BASE_M) * (fabs(deg) / 360.0f);   // per-wheel arc
   long  target = (long)(arc_m * ticksPerMeter());
 
-  bool leftFwd  = (deg < 0.0f);
-  bool rightFwd = (deg > 0.0f);
+  bool leftFwd  = (deg < 0.0f);  // CW (right turn): left fwd, right back
+  bool rightFwd = (deg > 0.0f);  // CCW (left turn):  right fwd, left back
   setDirLeft(leftFwd);
   setDirRight(rightFwd);
 
   long L0=getCountL(), R0=getCountR();
 
+  // Kick to overcome static friction
   setPWM(TURN_KICK_PWM, TURN_KICK_PWM);
   delay(TURN_KICK_MS);
 
+  // Steady power until target ticks reached on either wheel
   while (true){
     long L = labs(getCountL() - L0);
     long R = labs(getCountR() - R0);
@@ -287,8 +277,7 @@ void turnInPlace(float deg){
     setPWM(TURN_PWM_L, TURN_PWM_R);
     if (done >= target) break;
   }
-
-  electricalBrake();
+  stopMotors();
   delay(200);
 }
 
@@ -297,12 +286,15 @@ void ramAndReverse(float meters){
   if (meters < 0) meters = -meters;
   long target = (long)(meters * ticksPerMeter());
 
-  driveStraightToTicks(target, true);
+  // Forward to target (ratio MA)
+  driveStraightToTicks(target, /*forward=*/true);
 
+  // RAM push
   setPWM(RAM_KICK_PWM, RAM_KICK_PWM);
   delay(RAM_KICK_MS);
 
-  driveStraightToTicks(target, false);
+  // INSTANT reverse same distance (ratio MA)
+  driveStraightToTicks(target, /*forward=*/false);
 }
 
 /* =============================== Setup =============================== */
@@ -311,7 +303,7 @@ void setup(){
 #if DEBUG
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n=== Track Runner (ratio MA + auto polarity + dual-start + braking) ==="));
+  Serial.println(F("\n=== Track Runner (ratio MA + auto polarity + dual-start) ==="));
 #endif
   pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
   pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
@@ -340,12 +332,38 @@ void setup(){
 #endif
 }
 
-/* ================================ Main ================================ */
+/* ================================ Main ================================
+   Scripted path:
+
+   0.70 → Right 90 → 1.55 → Right 90 → 0.55 → reverse 0.55 →
+   Right 60 → 0.55 → reverse 0.225 → stop
+*/
 void loop(){
+  // 1) Forward 100 cm
   driveMeters(1.00f * DIST_CORR);
 
-  while (1) {
-    stopMotors();
-    delay(1000);
-  }
+
+  // 3) Forward 155 cm
+  //driveMeters(3.20f * DIST_CORR);
+
+  // 4) Right 90°
+  //turnInPlace(-90.0f * TURN_CORR);
+
+  // 5) Forward 55 cm
+  //driveMeters(0.25f * DIST_CORR);
+
+  // 6) Reverse 55 cm
+  //driveMeters(-0.30f * DIST_CORR);
+
+  // 7) Right 60°
+  //turnInPlace(67.5f * TURN_CORR);
+
+  // 8) Forward 55 cm
+  //driveMeters(1.550f * DIST_CORR);
+
+  // 9) Reverse 22.5 cm
+  //driveMeters(-0.20f * DIST_CORR);
+
+  // STOP!!!
+  while (1) { stopMotors(); delay(1000); }
 }
