@@ -11,14 +11,17 @@
 #include <Arduino.h>
 
 /* ===================== Pins (Raspberry Pi Pico + L298N) ===================== */
-#define ENA 0
-#define ENB 1
-#define IN1 3
-#define IN2 2
-#define IN3 5
-#define IN4 4
-#define ENC_L_A 7
-#define ENC_L_B 6
+// ===== Motor pins =====
+#define ENA 14
+#define ENB 15
+#define IN1 4
+#define IN2 5
+#define IN3 2
+#define IN4 3
+
+// ===== Encoder pins =====
+#define ENC_L_A 6
+#define ENC_L_B 7
 #define ENC_R_A 17
 #define ENC_R_B 16
 
@@ -30,9 +33,9 @@ inline float ticksPerMeter(){ return (float)TICKS_PER_REV / (PI * WHEEL_DIAMETER
 
 /* =============================== Tuning =============================== */
 /* Feed-forward split: start stronger side lower and weaker higher */
-int   BASE_L      = 255;   // left base PWM
-int   BASE_R      = 255;   // right base PWM
-int   MIN_PWM     = 150;   // floor to avoid stall
+int   BASE_L      = 200;   // left base PWM
+int   BASE_R      = 200;   // right base PWM
+int   MIN_PWM     = 180;   // floor to avoid stall
 
 /* Controller timing & logging */
 int   CTRL_DT_MS  = 15;    // control loop tick
@@ -40,9 +43,9 @@ int   PRINT_MS    = 100;   // debug cadence
 #define DEBUG 1
 
 /* Ratio controller: balance = K_RATIO * (|dR5|/|dL5| - 1), clamped */
-float K_RATIO     = 130.0f; // shove per 1.0 relative error
-float REL_CLAMP   = 0.20f;  // cap ratio error to ±20%
-int   BAL_CLAMP   = 30;     // cap balance PWM to ±30
+float K_RATIO     = 150.0f; // shove per 1.0 relative error
+float REL_CLAMP   = 0.01f;  // cap ratio error to ±20%
+int   BAL_CLAMP   = 20;     // cap balance PWM to ±30
 
 /* Moving average window (smoothing) */
 const int MA_N    = 5;
@@ -58,11 +61,11 @@ int RAM_KICK_PWM  = 175;
 int RAM_KICK_MS   = 45;
 
 /* Distance/turn correction knobs */
-float DIST_CORR = 0.650f;
-float TURN_CORR = .975f;
+float DIST_CORR = 0.725f;
+float TURN_CORR = 0.850f;
 
 /* ===== Simultaneous start gate ===== */
-int   START_KICK_PWM     = 190;   // initial shove to overcome static friction
+int   START_KICK_PWM     = 200;   // initial shove to overcome static friction
 int   START_HOLD_PWM     = 160;   // keep already-moving side slow while waiting
 int   START_MAX_WAIT_MS  = 600;   // overall wait guard
 int   START_WINDOW_MS    = 25;    // check cadence during start gate
@@ -337,12 +340,12 @@ void setup(){
 */
 void loop(){
   // 1) Forward 80 cm
-  driveMeters(0.80f * DIST_CORR);
+  driveMeters(0.80 * DIST_CORR);
 
-  // 2) Right 90°
+   // 4) Right 90°
   turnInPlace(-90.0f * TURN_CORR);
-
-  // 3) Forward 155 cm
+  
+  // 3) Forward 320 cm
   driveMeters(3.20f * DIST_CORR);
 
   // 4) Right 90°
@@ -360,7 +363,7 @@ void loop(){
   // 8) Forward 55 cm
   //driveMeters(1.550f * DIST_CORR);
 
-  // 9) Reverse 22.5 cm
+  // 9) Reverse 20 cm
   driveMeters(-0.20f * DIST_CORR);
 
   // STOP!!!
