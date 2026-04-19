@@ -53,7 +53,7 @@ int REVERSE_KICK_MS  = 50;
 /* =============================== Distance PID =============================== */
 float DIST_KP = 30.0f;
 float DIST_KI = 0.0f;
-float DIST_KD = 5.0f;
+float DIST_KD = 0.0f;
 
 /* =============================== K-ratio Balance =============================== */
 float K_RATIO   = 150.0f;
