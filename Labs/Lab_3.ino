@@ -13,8 +13,8 @@
 #define ENC_R_B 16
 
 /* ===================== Ultrasonic ===================== */
-#define US_FRONT_ECHO 8
-#define US_FRONT_TRIG 9
+#define US_ECHO 8
+#define US_TRIG 9
 
 /* ===================== Geometry / Encoder ===================== */
 const float WHEEL_DIAMETER_M = 0.07070f;
@@ -25,40 +25,50 @@ inline float ticksPerMeter() {
 }
 
 /* =============================== Timing =============================== */
-const int CTRL_DT_MS = 15;
-const int PRINT_MS   = 100;
+const int CTRL_DT_MS  = 20;
+const int PRINT_MS    = 100;
 #define DEBUG 1
 
-/* =============================== Target Distance =============================== */
-float DIST_SET_CM = 25.0f;
+/* =============================== Follow Goal =============================== */
+float DIST_SET_CM        = 25.0f;   // desired distance from object
+float DIST_DEADBAND_CM   = 2.50f;    // stop band
+float DIST_REVERSE_AT_CM = 22.50f;   // definitely too close => reverse
 
 /* =============================== Limits =============================== */
-int MIN_PWM_MOVE = 150;
-int MAX_FWD_PWM  = 255;
-int MAX_REV_PWM  = 255;
+int MAX_PWM        = 255;
+int MIN_PWM_MOVE   = 150;   // raised to overcome reverse hesitation
+int MAX_FWD_PWM    = 255;
+int MAX_REV_PWM    = 255;   // reverse still capped slightly lower than full
 
 /* =============================== Safety =============================== */
 float MAX_VALID_US_CM  = 300.0f;
 int   ULTRA_TIMEOUT_US = 30000;
+int   LOST_TARGET_MAX  = 5;
 
 /* =============================== Braking =============================== */
 bool ENABLE_DIRECTION_BRAKE = true;
 int  BRAKE_PWM              = 255;
-int  BRAKE_TIME_MS          = 200;
+int  BRAKE_TIME_MS          = 200;   // longer brake before reverse
 
 /* =============================== Reverse kick =============================== */
-int REVERSE_KICK_PWM = 255;
+int REVERSE_KICK_PWM = 255;   // short shove when reverse begins
 int REVERSE_KICK_MS  = 50;
 
 /* =============================== Distance PID =============================== */
+/*
+   err = measured_distance - desired_distance
+
+   err > 0 => too far  => forward
+   err < 0 => too close => reverse
+*/
 float DIST_KP = 30.0f;
 float DIST_KI = 0.0f;
-float DIST_KD = 0.0f;
+float DIST_KD = 10.0f;
 
 /* =============================== K-ratio Balance =============================== */
 float K_RATIO   = 150.0f;
-float REL_CLAMP = 0.01f;
-int   BAL_CLAMP = 20;
+float REL_CLAMP = 0.20f;
+int   BAL_CLAMP = 40;
 
 const int MA_N = 5;
 
@@ -71,15 +81,12 @@ bool MOTOR_INV_RIGHT   = true;
 bool ENCODER_INV_LEFT  = false;
 bool ENCODER_INV_RIGHT = false;
 
-float distF = -1.0f;
+float distFilteredCm = -1.0f;
+int   lostTargetCount = 0;
 
 int baseCmdPWM = 0;
 int pwmCmdL    = 0;
 int pwmCmdR    = 0;
-
-float encVelL_mps    = 0.0f;
-float encVelR_mps    = 0.0f;
-float encVelAvg_mps  = 0.0f;
 
 /* ========================== Brake State Machine ========================== */
 bool brakeActive = false;
@@ -208,13 +215,13 @@ long getCountR() {
 void setDirLeft(bool forward) {
   bool d = forward ^ MOTOR_INV_LEFT;
   digitalWrite(IN1, d ? HIGH : LOW);
-  digitalWrite(IN2, d ? LOW : HIGH);
+  digitalWrite(IN2, d ? LOW  : HIGH);
 }
 
 void setDirRight(bool forward) {
   bool d = forward ^ MOTOR_INV_RIGHT;
   digitalWrite(IN3, d ? HIGH : LOW);
-  digitalWrite(IN4, d ? LOW : HIGH);
+  digitalWrite(IN4, d ? LOW  : HIGH);
 }
 
 void stopMotors() {
@@ -318,57 +325,41 @@ void setMotorSignedPWM(int pwmL, int pwmR) {
   applyMotorSignedPWMNow(pwmL, pwmR);
 }
 
-/* ===================== Ultrasonic Read ===================== */
-float readUSRaw(int trigPin, int echoPin) {
-  digitalWrite(trigPin, LOW);
+/* ===================== Ultrasonic ===================== */
+float readUltrasonicCmRaw() {
+  digitalWrite(US_TRIG, LOW);
   delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
+  digitalWrite(US_TRIG, HIGH);
   delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
+  digitalWrite(US_TRIG, LOW);
 
-  unsigned long duration = pulseIn(echoPin, HIGH, ULTRA_TIMEOUT_US);
+  unsigned long duration = pulseIn(US_ECHO, HIGH, ULTRA_TIMEOUT_US);
   if (duration == 0) return -1.0f;
 
   float cm = (duration * 0.0343f) / 2.0f;
-  if (cm > MAX_VALID_US_CM) return -1.0f;
-
   return cm;
 }
 
-void updateSensors() {
-  distF = readUSRaw(US_FRONT_TRIG, US_FRONT_ECHO);
-}
+float readUltrasonicCmFiltered() {
+  float d = readUltrasonicCmRaw();
 
-/* ===================== Encoder Velocity ===================== */
-void updateEncoderVelocity(float dt) {
-  static long lastL = 0;
-  static long lastR = 0;
-  static bool first = true;
-
-  long nowL = getCountL();
-  long nowR = getCountR();
-
-  if (first) {
-    lastL = nowL;
-    lastR = nowR;
-    encVelL_mps = 0.0f;
-    encVelR_mps = 0.0f;
-    encVelAvg_mps = 0.0f;
-    first = false;
-    return;
+  if (d < 0.0f || d > MAX_VALID_US_CM) {
+    lostTargetCount++;
+    if (lostTargetCount > LOST_TARGET_MAX) {
+      distFilteredCm = -1.0f;
+    }
+    return distFilteredCm;
   }
 
-  long dL = nowL - lastL;
-  long dR = nowR - lastR;
+  lostTargetCount = 0;
 
-  lastL = nowL;
-  lastR = nowR;
+  if (distFilteredCm < 0.0f) {
+    distFilteredCm = d;
+  } else {
+    distFilteredCm = 0.4f * distFilteredCm + 0.6f * d;
+  }
 
-  float tpm = ticksPerMeter();
-
-  encVelL_mps = ((float)dL / tpm) / dt;
-  encVelR_mps = ((float)dR / tpm) / dt;
-  encVelAvg_mps = 0.5f * (encVelL_mps + encVelR_mps);
+  return distFilteredCm;
 }
 
 /* ===================== Auto Encoder Polarity ===================== */
@@ -407,43 +398,82 @@ void autoConfigure() {
 #endif
 }
 
-/* ===================== Distance Control ===================== */
-void updateDistancePID(float dt) {
-  if (distF < 0.0f) {
+/* ===================== Distance PID ===================== */
+void updateDistanceControl(float dt) {
+  float d = readUltrasonicCmFiltered();
+
+  if (d < 0.0f) {
     baseCmdPWM = 0;
     pidDist.reset();
     return;
   }
 
-  float err = distF - DIST_SET_CM;   // positive -> too far -> move forward
-  int cmd = (int)roundf(pidDist.update(err, dt));
-
-  if (cmd > 0) {
-    if (cmd < MIN_PWM_MOVE) cmd = MIN_PWM_MOVE;
-    if (cmd > MAX_FWD_PWM)  cmd = MAX_FWD_PWM;
-  } else if (cmd < 0) {
-    if (cmd > -MIN_PWM_MOVE) cmd = -MIN_PWM_MOVE;
-    if (cmd < -MAX_REV_PWM)  cmd = -MAX_REV_PWM;
+  if (fabs(d - DIST_SET_CM) <= DIST_DEADBAND_CM) {
+    baseCmdPWM = 0;
+    pidDist.reset();
+    return;
   }
 
-  baseCmdPWM = cmd;
+  if (d <= DIST_REVERSE_AT_CM) {
+    float err = d - DIST_REVERSE_AT_CM;
+    int cmd = (int)roundf(pidDist.update(err, dt));
+
+    // Force a meaningful reverse command
+    if (cmd > -MIN_PWM_MOVE) cmd = -MIN_PWM_MOVE;
+    if (cmd < -MAX_REV_PWM)  cmd = -MAX_REV_PWM;
+
+    baseCmdPWM = cmd;
+    return;
+  }
+
+  if (d > DIST_SET_CM + DIST_DEADBAND_CM) {
+    float err = d - DIST_SET_CM;
+    int cmd = (int)roundf(pidDist.update(err, dt));
+
+    if (cmd < MIN_PWM_MOVE) cmd = MIN_PWM_MOVE;
+    if (cmd > MAX_FWD_PWM)  cmd = MAX_FWD_PWM;
+
+    baseCmdPWM = cmd;
+    return;
+  }
+
+  baseCmdPWM = 0;
+  pidDist.reset();
 }
 
-/* ===================== Straight Balance ===================== */
+/* ===================== K-ratio Straight Balancer ===================== */
 void updateStraightBalanceAndDrive() {
-  static float bufL[MA_N] = {0};
-  static float bufR[MA_N] = {0};
-  static float sumL = 0.0f;
-  static float sumR = 0.0f;
+  static long lastL = 0;
+  static long lastR = 0;
+  static bool first = true;
+
+  static long bufL[MA_N] = {0};
+  static long bufR[MA_N] = {0};
+  static long sumL = 0;
+  static long sumR = 0;
   static int idx = 0;
   static int filled = 0;
 
+  long nowL = getCountL();
+  long nowR = getCountR();
+
+  if (first) {
+    lastL = nowL;
+    lastR = nowR;
+    first = false;
+    setMotorSignedPWM(baseCmdPWM, baseCmdPWM);
+    return;
+  }
+
+  long dL = nowL - lastL;
+  long dR = nowR - lastR;
+  lastL = nowL;
+  lastR = nowR;
+
   sumL -= bufL[idx];
   sumR -= bufR[idx];
-
-  bufL[idx] = encVelL_mps;
-  bufR[idx] = encVelR_mps;
-
+  bufL[idx] = dL;
+  bufR[idx] = dR;
   sumL += bufL[idx];
   sumR += bufR[idx];
 
@@ -454,8 +484,8 @@ void updateStraightBalanceAndDrive() {
   int finalR = baseCmdPWM;
 
   if (baseCmdPWM != 0) {
-    float aL = fabsf(sumL / (float)filled);
-    float aR = fabsf(sumR / (float)filled);
+    float aL = fabsf((float)sumL);
+    float aR = fabsf((float)sumR);
 
     float rel;
     if (aL == 0.0f && aR == 0.0f) rel = 0.0f;
@@ -484,43 +514,44 @@ void updateStraightBalanceAndDrive() {
       if (finalL < -MAX_REV_PWM) finalL = -MAX_REV_PWM;
       if (finalR < -MAX_REV_PWM) finalR = -MAX_REV_PWM;
     }
+
+#if DEBUG
+    static unsigned long lastDbg = 0;
+    unsigned long now = millis();
+    if (now - lastDbg >= (unsigned long)PRINT_MS) {
+      lastDbg = now;
+
+      float dLma = (filled > 0) ? (float)sumL / (float)filled : 0.0f;
+      float dRma = (filled > 0) ? (float)sumR / (float)filled : 0.0f;
+
+      Serial.print(F("dist="));
+      Serial.print(distFilteredCm, 2);
+      Serial.print(F(" cm  base="));
+      Serial.print(baseCmdPWM);
+
+      Serial.print(F("  dL5="));
+      Serial.print(dLma, 2);
+      Serial.print(F("  dR5="));
+      Serial.print(dRma, 2);
+
+      Serial.print(F("  rel="));
+      Serial.print(rel, 4);
+
+      Serial.print(F("  pwmL="));
+      Serial.print(finalL);
+      Serial.print(F("  pwmR="));
+      Serial.print(finalR);
+
+      Serial.print(F("  lost="));
+      Serial.print(lostTargetCount);
+
+      Serial.print(F("  brake="));
+      Serial.println(brakeActive);
+    }
+#endif
   }
 
   setMotorSignedPWM(finalL, finalR);
-}
-
-/* ===================== Debug Print ===================== */
-void printSensors() {
-#if DEBUG
-  static unsigned long lastPrint = 0;
-  unsigned long now = millis();
-
-  if (now - lastPrint >= (unsigned long)PRINT_MS) {
-    lastPrint = now;
-
-    Serial.print(F("F="));
-    Serial.print(distF, 2);
-
-    Serial.print(F("  err="));
-    if (distF > 0.0f) Serial.print(distF - DIST_SET_CM, 2);
-    else              Serial.print(-999.0f, 2);
-
-    Serial.print(F("  vL="));
-    Serial.print(encVelL_mps, 3);
-
-    Serial.print(F("  vR="));
-    Serial.print(encVelR_mps, 3);
-
-    Serial.print(F("  vAvg="));
-    Serial.print(encVelAvg_mps, 3);
-
-    Serial.print(F("  base="));
-    Serial.print(baseCmdPWM);
-
-    Serial.print(F("  brake="));
-    Serial.println(brakeActive);
-  }
-#endif
 }
 
 /* =============================== Setup =============================== */
@@ -530,7 +561,7 @@ void setup() {
 #if DEBUG
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n=== Front Ultrasonic Constant Distance Control ==="));
+  Serial.println(F("\n=== Ultrasonic PID + K-Ratio Balance (reverse-fixed) ==="));
 #endif
 
   pinMode(ENA, OUTPUT);
@@ -540,9 +571,9 @@ void setup() {
   pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
 
-  pinMode(US_FRONT_TRIG, OUTPUT);
-  pinMode(US_FRONT_ECHO, INPUT);
-  digitalWrite(US_FRONT_TRIG, LOW);
+  pinMode(US_TRIG, OUTPUT);
+  pinMode(US_ECHO, INPUT);
+  digitalWrite(US_TRIG, LOW);
 
   pinMode(ENC_L_A, INPUT_PULLUP);
   pinMode(ENC_L_B, INPUT_PULLUP);
@@ -557,21 +588,47 @@ void setup() {
   stopMotors();
   autoConfigure();
 
-  pidDist.set(DIST_KP, DIST_KI, DIST_KD, -MAX_REV_PWM, MAX_FWD_PWM);
+  pidDist.set(
+    DIST_KP,
+    DIST_KI,
+    DIST_KD,
+    -MAX_REV_PWM,
+    MAX_FWD_PWM
+  );
 
 #if DEBUG
-  Serial.print(F("DIST_SET_CM = "));
+  Serial.print(F("ticks/m = "));
+  Serial.println(ticksPerMeter());
+
+  Serial.print(F("Distance setpoint (cm) = "));
   Serial.println(DIST_SET_CM);
 
-  Serial.print(F("DIST PID = "));
-  Serial.print(DIST_KP);
-  Serial.print(F(", "));
-  Serial.print(DIST_KI);
-  Serial.print(F(", "));
-  Serial.println(DIST_KD);
+  Serial.print(F("Reverse threshold (cm) = "));
+  Serial.println(DIST_REVERSE_AT_CM);
+
+  Serial.print(F("Distance deadband (cm) = "));
+  Serial.println(DIST_DEADBAND_CM);
+
+  Serial.print(F("Forward/Reverse max PWM = "));
+  Serial.print(MAX_FWD_PWM);
+  Serial.print(F(" / "));
+  Serial.println(MAX_REV_PWM);
 
   Serial.print(F("MIN_PWM_MOVE = "));
   Serial.println(MIN_PWM_MOVE);
+
+  Serial.print(F("K_RATIO = "));
+  Serial.println(K_RATIO);
+
+  Serial.print(F("Brake PWM / Time = "));
+  Serial.print(BRAKE_PWM);
+  Serial.print(F(" / "));
+  Serial.println(BRAKE_TIME_MS);
+
+  Serial.print(F("Reverse kick PWM / Time = "));
+  Serial.print(REVERSE_KICK_PWM);
+  Serial.print(F(" / "));
+  Serial.println(REVERSE_KICK_MS);
 #endif
 }
 
@@ -588,7 +645,6 @@ void loop() {
       applyMotorSignedPWMNow(pendingPwmL, pendingPwmR);
     } else {
       activeBrake(BRAKE_PWM);
-      printSensors();
       return;
     }
   }
@@ -597,10 +653,7 @@ void loop() {
     float dt = (now - lastCtrlMs) / 1000.0f;
     lastCtrlMs = now;
 
-    updateSensors();
-    updateEncoderVelocity(dt);
-    updateDistancePID(dt);
+    updateDistanceControl(dt);
     updateStraightBalanceAndDrive();
-    printSensors();
   }
 }
