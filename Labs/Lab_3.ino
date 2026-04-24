@@ -1,104 +1,100 @@
 #include <Arduino.h>
 
-/* ===================== Pins (Raspberry Pi Pico + L298N) ===================== */
+/* ===================== Debug / Mode Toggles ===================== */
+#define DEBUG 1
+
+#define DEBUG_SENSORS 1
+#define DEBUG_ACTIONS 1
+
+#define ENABLE_FORWARD_BACKWARD 1
+// 0 = only test left/right turning using side ultrasonic sensors
+// 1 = enable normal front distance-following forward/backward motion
+
+/* ===================== Pins ===================== */
 #define ENA 14
 #define ENB 15
+
 #define IN1 4
 #define IN2 5
 #define IN3 2
 #define IN4 3
+
 #define ENC_L_A 6
 #define ENC_L_B 7
 #define ENC_R_A 17
 #define ENC_R_B 16
 
-/* ===================== Ultrasonic ===================== */
-#define US_ECHO 8
-#define US_TRIG 9
+/* ===================== Ultrasonic Sensors ===================== */
+#define US_FRONT_ECHO 8
+#define US_FRONT_TRIG 9
 
-/* ===================== Geometry / Encoder ===================== */
-const float WHEEL_DIAMETER_M = 0.07070f;
-const long  TICKS_PER_REV    = 1125;
+#define US_LEFT_ECHO 10
+#define US_LEFT_TRIG 11
 
-inline float ticksPerMeter() {
-  return (float)TICKS_PER_REV / (PI * WHEEL_DIAMETER_M);
-}
+#define US_RIGHT_ECHO 12
+#define US_RIGHT_TRIG 13
 
-/* =============================== Timing =============================== */
-const int CTRL_DT_MS  = 20;
-const int PRINT_MS    = 100;
-#define DEBUG 1
+/* ===================== Constants ===================== */
+const int CTRL_DT_MS = 20;
+const int PRINT_MS = 100;
 
-/* =============================== Follow Goal =============================== */
-float DIST_SET_CM        = 25.0f;   // desired distance from object
-float DIST_DEADBAND_CM   = 2.50f;    // stop band
-float DIST_REVERSE_AT_CM = 22.50f;   // definitely too close => reverse
+float DIST_SET_CM = 25.0f;
+float DIST_DEADBAND_CM = 2.50f;
+float DIST_REVERSE_AT_CM = 22.50f;
 
-/* =============================== Limits =============================== */
-int MAX_PWM        = 255;
-int MIN_PWM_MOVE   = 150;   // raised to overcome reverse hesitation
-int MAX_FWD_PWM    = 255;
-int MAX_REV_PWM    = 255;   // reverse still capped slightly lower than full
+float SIDE_DETECT_CM = 50.0f;
+int TURN_PWM = 180;
 
-/* =============================== Safety =============================== */
-float MAX_VALID_US_CM  = 300.0f;
-int   ULTRA_TIMEOUT_US = 30000;
-int   LOST_TARGET_MAX  = 5;
+int MIN_PWM_MOVE = 150;
+int MAX_FWD_PWM = 255;
+int MAX_REV_PWM = 255;
 
-/* =============================== Braking =============================== */
+float MAX_VALID_US_CM = 300.0f;
+int ULTRA_TIMEOUT_US = 30000;
+int LOST_TARGET_MAX = 5;
+
 bool ENABLE_DIRECTION_BRAKE = true;
-int  BRAKE_PWM              = 255;
-int  BRAKE_TIME_MS          = 200;   // longer brake before reverse
+int BRAKE_PWM = 255;
+int BRAKE_TIME_MS = 200;
 
-/* =============================== Reverse kick =============================== */
-int REVERSE_KICK_PWM = 255;   // short shove when reverse begins
-int REVERSE_KICK_MS  = 50;
+int REVERSE_KICK_PWM = 255;
+int REVERSE_KICK_MS = 50;
 
-/* =============================== Distance PID =============================== */
-/*
-   err = measured_distance - desired_distance
-
-   err > 0 => too far  => forward
-   err < 0 => too close => reverse
-*/
 float DIST_KP = 30.0f;
 float DIST_KI = 0.0f;
 float DIST_KD = 10.0f;
 
-/* =============================== K-ratio Balance =============================== */
-float K_RATIO   = 150.0f;
-float REL_CLAMP = 0.20f;
-int   BAL_CLAMP = 40;
-
-const int MA_N = 5;
-
-/* =============================== State =============================== */
+/* ===================== State ===================== */
 volatile long encL = 0;
 volatile long encR = 0;
 
-bool MOTOR_INV_LEFT    = true;
-bool MOTOR_INV_RIGHT   = true;
-bool ENCODER_INV_LEFT  = false;
+bool MOTOR_INV_LEFT = true;
+bool MOTOR_INV_RIGHT = true;
+bool ENCODER_INV_LEFT = false;
 bool ENCODER_INV_RIGHT = false;
 
 float distFilteredCm = -1.0f;
-int   lostTargetCount = 0;
+int lostTargetCount = 0;
 
 int baseCmdPWM = 0;
-int pwmCmdL    = 0;
-int pwmCmdR    = 0;
+int pwmCmdL = 0;
+int pwmCmdR = 0;
 
-/* ========================== Brake State Machine ========================== */
 bool brakeActive = false;
 unsigned long brakeStartMs = 0;
 int pendingPwmL = 0;
 int pendingPwmR = 0;
 
+int latchedSide = 0;
+// 0  = no latch
+// -1 = locked LEFT
+// +1 = locked RIGHT
+
 #ifndef digitalReadFast
 #define digitalReadFast digitalRead
 #endif
 
-/* =============================== PID Struct =============================== */
+/* ===================== PID ===================== */
 struct PID {
   float kp, ki, kd;
   float integ;
@@ -133,8 +129,7 @@ struct PID {
   float update(float err, float dt) {
     if (dt <= 0.0f) return 0.0f;
 
-    float deriv = 0.0f;
-    if (!first) deriv = (err - prevErr) / dt;
+    float deriv = first ? 0.0f : (err - prevErr) / dt;
     first = false;
 
     float newInteg = integ + err * dt;
@@ -156,7 +151,7 @@ struct PID {
 
 PID pidDist;
 
-/* ============================ Encoder ISRs ============================ */
+/* ===================== Encoder ISRs ===================== */
 void isrLeftA() {
   bool A = digitalReadFast(ENC_L_A);
   bool B = digitalReadFast(ENC_L_B);
@@ -181,8 +176,8 @@ void isrRightB() {
   encR += (A != B) ? +1 : -1;
 }
 
-/* ============================== Helpers ============================== */
-inline int clamp255(int x) {
+/* ===================== Motor Helpers ===================== */
+int clamp255(int x) {
   if (x < 0) return 0;
   if (x > 255) return 255;
   return x;
@@ -202,35 +197,27 @@ long getRawR() {
   return v;
 }
 
-long getCountL() {
-  long v = getRawL();
-  return ENCODER_INV_LEFT ? -v : v;
-}
-
-long getCountR() {
-  long v = getRawR();
-  return ENCODER_INV_RIGHT ? -v : v;
-}
-
 void setDirLeft(bool forward) {
   bool d = forward ^ MOTOR_INV_LEFT;
   digitalWrite(IN1, d ? HIGH : LOW);
-  digitalWrite(IN2, d ? LOW  : HIGH);
+  digitalWrite(IN2, d ? LOW : HIGH);
 }
 
 void setDirRight(bool forward) {
   bool d = forward ^ MOTOR_INV_RIGHT;
   digitalWrite(IN3, d ? HIGH : LOW);
-  digitalWrite(IN4, d ? LOW  : HIGH);
+  digitalWrite(IN4, d ? LOW : HIGH);
 }
 
 void stopMotors() {
   analogWrite(ENA, 0);
   analogWrite(ENB, 0);
+
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
+
   pwmCmdL = 0;
   pwmCmdR = 0;
 }
@@ -254,14 +241,14 @@ void applyMotorSignedPWMNow(int pwmL, int pwmR) {
   static int prevSignL = 0;
   static int prevSignR = 0;
 
-  bool dirL = (pwmL >= 0);
-  bool dirR = (pwmR >= 0);
+  bool dirL = pwmL >= 0;
+  bool dirR = pwmR >= 0;
 
   int magL = abs(pwmL);
   int magR = abs(pwmR);
 
-  int signL = (magL == 0) ? 0 : (dirL ? 1 : -1);
-  int signR = (magR == 0) ? 0 : (dirR ? 1 : -1);
+  int signL = magL == 0 ? 0 : dirL ? 1 : -1;
+  int signR = magR == 0 ? 0 : dirR ? 1 : -1;
 
   if (magL > 0 && magL < MIN_PWM_MOVE) magL = MIN_PWM_MOVE;
   if (magR > 0 && magR < MIN_PWM_MOVE) magR = MIN_PWM_MOVE;
@@ -273,7 +260,7 @@ void applyMotorSignedPWMNow(int pwmL, int pwmR) {
   setDirRight(dirR);
 
   bool reverseStart =
-      ((prevSignL >= 0 && signL < 0) || (prevSignR >= 0 && signR < 0));
+    ((prevSignL >= 0 && signL < 0) || (prevSignR >= 0 && signR < 0));
 
   if (reverseStart) {
     analogWrite(ENA, REVERSE_KICK_PWM);
@@ -292,28 +279,25 @@ void applyMotorSignedPWMNow(int pwmL, int pwmR) {
 }
 
 void setMotorSignedPWM(int pwmL, int pwmR) {
-  bool newDirL = (pwmL >= 0);
-  bool newDirR = (pwmR >= 0);
+  bool newDirL = pwmL >= 0;
+  bool newDirR = pwmR >= 0;
 
-  bool oldDirL = (pwmCmdL >= 0);
-  bool oldDirR = (pwmCmdR >= 0);
+  bool oldDirL = pwmCmdL >= 0;
+  bool oldDirR = pwmCmdR >= 0;
 
   int magL = abs(pwmL);
   int magR = abs(pwmR);
 
-  bool wantMoveL = (magL > 0);
-  bool wantMoveR = (magR > 0);
+  bool wantMoveL = magL > 0;
+  bool wantMoveR = magR > 0;
 
-  bool oldMoveL = (abs(pwmCmdL) > 0);
-  bool oldMoveR = (abs(pwmCmdR) > 0);
+  bool oldMoveL = abs(pwmCmdL) > 0;
+  bool oldMoveR = abs(pwmCmdR) > 0;
 
   bool dirFlipL = oldMoveL && wantMoveL && (newDirL != oldDirL);
   bool dirFlipR = oldMoveR && wantMoveR && (newDirR != oldDirR);
 
-  bool meaningfulFlipL = dirFlipL && (magL >= MIN_PWM_MOVE);
-  bool meaningfulFlipR = dirFlipR && (magR >= MIN_PWM_MOVE);
-
-  if (ENABLE_DIRECTION_BRAKE && (meaningfulFlipL || meaningfulFlipR)) {
+  if (ENABLE_DIRECTION_BRAKE && (dirFlipL || dirFlipR)) {
     brakeActive = true;
     brakeStartMs = millis();
     pendingPwmL = pwmL;
@@ -326,28 +310,35 @@ void setMotorSignedPWM(int pwmL, int pwmR) {
 }
 
 /* ===================== Ultrasonic ===================== */
-float readUltrasonicCmRaw() {
-  digitalWrite(US_TRIG, LOW);
+float readUltrasonicCmRaw(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
-  digitalWrite(US_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(US_TRIG, LOW);
 
-  unsigned long duration = pulseIn(US_ECHO, HIGH, ULTRA_TIMEOUT_US);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  unsigned long duration = pulseIn(echoPin, HIGH, ULTRA_TIMEOUT_US);
+
   if (duration == 0) return -1.0f;
 
-  float cm = (duration * 0.0343f) / 2.0f;
+  float cm = duration * 0.0343f / 2.0f;
+
+  if (cm <= 0.0f || cm > MAX_VALID_US_CM) return -1.0f;
+
   return cm;
 }
 
 float readUltrasonicCmFiltered() {
-  float d = readUltrasonicCmRaw();
+  float d = readUltrasonicCmRaw(US_FRONT_TRIG, US_FRONT_ECHO);
 
   if (d < 0.0f || d > MAX_VALID_US_CM) {
     lostTargetCount++;
+
     if (lostTargetCount > LOST_TARGET_MAX) {
       distFilteredCm = -1.0f;
     }
+
     return distFilteredCm;
   }
 
@@ -362,6 +353,108 @@ float readUltrasonicCmFiltered() {
   return distFilteredCm;
 }
 
+/* ===================== Debug Printing ===================== */
+void printSensorDebug(float front, float left, float right) {
+#if DEBUG_SENSORS
+  static unsigned long lastPrint = 0;
+  unsigned long now = millis();
+
+  if (now - lastPrint < (unsigned long)PRINT_MS) return;
+  lastPrint = now;
+
+  Serial.print(F("FRONT="));
+  Serial.print(front, 2);
+  Serial.print(F(" cm | LEFT="));
+  Serial.print(left, 2);
+  Serial.print(F(" cm | RIGHT="));
+  Serial.print(right, 2);
+
+  Serial.print(F(" | LATCH="));
+
+  if (latchedSide == -1) Serial.print(F("LEFT"));
+  else if (latchedSide == +1) Serial.print(F("RIGHT"));
+  else Serial.print(F("NONE"));
+
+  Serial.print(F(" | frontValid="));
+  Serial.print(front > 0.0f);
+
+  Serial.print(F(" | leftDetect="));
+  Serial.print(left > 0.0f && left < SIDE_DETECT_CM);
+
+  Serial.print(F(" | rightDetect="));
+  Serial.print(right > 0.0f && right < SIDE_DETECT_CM);
+
+  Serial.println();
+#endif
+}
+
+void printActionDebug(const char *msg) {
+#if DEBUG_ACTIONS
+  Serial.println(msg);
+#endif
+}
+
+/* ===================== Side Sensor Latch Turn Logic ===================== */
+bool acquireFrontFromSideSensors() {
+  float front = readUltrasonicCmRaw(US_FRONT_TRIG, US_FRONT_ECHO);
+  float left  = readUltrasonicCmRaw(US_LEFT_TRIG, US_LEFT_ECHO);
+  float right = readUltrasonicCmRaw(US_RIGHT_TRIG, US_RIGHT_ECHO);
+
+  bool frontDetect = front > 0.0f;
+  bool leftDetect  = left > 0.0f && left < SIDE_DETECT_CM;
+  bool rightDetect = right > 0.0f && right < SIDE_DETECT_CM;
+
+  printSensorDebug(front, left, right);
+
+  if (frontDetect) {
+    latchedSide = 0;
+    printActionDebug("ACTION: front acquired -> releasing latch");
+    return false;
+  }
+
+  baseCmdPWM = 0;
+  pidDist.reset();
+  distFilteredCm = -1.0f;
+  lostTargetCount = 0;
+
+  if (latchedSide == 0) {
+    if (leftDetect && rightDetect) {
+      latchedSide = (left <= right) ? -1 : +1;
+
+      if (latchedSide == -1) {
+        printActionDebug("LATCH: both detect, LEFT closer -> locked LEFT");
+      } else {
+        printActionDebug("LATCH: both detect, RIGHT closer -> locked RIGHT");
+      }
+    } else if (leftDetect) {
+      latchedSide = -1;
+      printActionDebug("LATCH: locked LEFT");
+    } else if (rightDetect) {
+      latchedSide = +1;
+      printActionDebug("LATCH: locked RIGHT");
+    } else {
+      printActionDebug("ACTION: no side detection -> STOP");
+      stopMotors();
+      return true;
+    }
+  }
+
+  if (latchedSide == -1) {
+    printActionDebug("ACTION: latched LEFT -> turning LEFT");
+    setMotorSignedPWM(-TURN_PWM, TURN_PWM);
+    return true;
+  }
+
+  if (latchedSide == +1) {
+    printActionDebug("ACTION: latched RIGHT -> turning RIGHT");
+    setMotorSignedPWM(TURN_PWM, -TURN_PWM);
+    return true;
+  }
+
+  stopMotors();
+  return true;
+}
+
 /* ===================== Auto Encoder Polarity ===================== */
 void autoConfigure() {
 #if DEBUG
@@ -373,8 +466,10 @@ void autoConfigure() {
 
   setDirLeft(true);
   setDirRight(true);
+
   analogWrite(ENA, 170);
   analogWrite(ENB, 170);
+
   delay(500);
 
   stopMotors();
@@ -383,8 +478,8 @@ void autoConfigure() {
   long dL = getRawL() - l0;
   long dR = getRawR() - r0;
 
-  ENCODER_INV_LEFT  = (dL < 0);
-  ENCODER_INV_RIGHT = (dR < 0);
+  ENCODER_INV_LEFT = dL < 0;
+  ENCODER_INV_RIGHT = dR < 0;
 
 #if DEBUG
   Serial.print(F("[AUTOCONFIG] dL="));
@@ -398,7 +493,7 @@ void autoConfigure() {
 #endif
 }
 
-/* ===================== Distance PID ===================== */
+/* ===================== Front Distance Control ===================== */
 void updateDistanceControl(float dt) {
   float d = readUltrasonicCmFiltered();
 
@@ -418,9 +513,8 @@ void updateDistanceControl(float dt) {
     float err = d - DIST_REVERSE_AT_CM;
     int cmd = (int)roundf(pidDist.update(err, dt));
 
-    // Force a meaningful reverse command
     if (cmd > -MIN_PWM_MOVE) cmd = -MIN_PWM_MOVE;
-    if (cmd < -MAX_REV_PWM)  cmd = -MAX_REV_PWM;
+    if (cmd < -MAX_REV_PWM) cmd = -MAX_REV_PWM;
 
     baseCmdPWM = cmd;
     return;
@@ -431,7 +525,7 @@ void updateDistanceControl(float dt) {
     int cmd = (int)roundf(pidDist.update(err, dt));
 
     if (cmd < MIN_PWM_MOVE) cmd = MIN_PWM_MOVE;
-    if (cmd > MAX_FWD_PWM)  cmd = MAX_FWD_PWM;
+    if (cmd > MAX_FWD_PWM) cmd = MAX_FWD_PWM;
 
     baseCmdPWM = cmd;
     return;
@@ -441,139 +535,55 @@ void updateDistanceControl(float dt) {
   pidDist.reset();
 }
 
-/* ===================== K-ratio Straight Balancer ===================== */
-void updateStraightBalanceAndDrive() {
-  static long lastL = 0;
-  static long lastR = 0;
-  static bool first = true;
-
-  static long bufL[MA_N] = {0};
-  static long bufR[MA_N] = {0};
-  static long sumL = 0;
-  static long sumR = 0;
-  static int idx = 0;
-  static int filled = 0;
-
-  long nowL = getCountL();
-  long nowR = getCountR();
-
-  if (first) {
-    lastL = nowL;
-    lastR = nowR;
-    first = false;
-    setMotorSignedPWM(baseCmdPWM, baseCmdPWM);
-    return;
-  }
-
-  long dL = nowL - lastL;
-  long dR = nowR - lastR;
-  lastL = nowL;
-  lastR = nowR;
-
-  sumL -= bufL[idx];
-  sumR -= bufR[idx];
-  bufL[idx] = dL;
-  bufR[idx] = dR;
-  sumL += bufL[idx];
-  sumR += bufR[idx];
-
-  idx = (idx + 1) % MA_N;
-  if (filled < MA_N) filled++;
-
-  int finalL = baseCmdPWM;
-  int finalR = baseCmdPWM;
-
-  if (baseCmdPWM != 0) {
-    float aL = fabsf((float)sumL);
-    float aR = fabsf((float)sumR);
-
-    float rel;
-    if (aL == 0.0f && aR == 0.0f) rel = 0.0f;
-    else if (aL == 0.0f)          rel = REL_CLAMP;
-    else {
-      rel = (aR / aL) - 1.0f;
-      if (rel >  REL_CLAMP) rel =  REL_CLAMP;
-      if (rel < -REL_CLAMP) rel = -REL_CLAMP;
-    }
-
-    int balance = (int)roundf(K_RATIO * rel);
-    if (balance >  BAL_CLAMP) balance =  BAL_CLAMP;
-    if (balance < -BAL_CLAMP) balance = -BAL_CLAMP;
-
-    finalL = baseCmdPWM + balance;
-    finalR = baseCmdPWM - balance;
-
-    if (baseCmdPWM > 0) {
-      if (finalL < 0) finalL = 0;
-      if (finalR < 0) finalR = 0;
-      if (finalL > MAX_FWD_PWM) finalL = MAX_FWD_PWM;
-      if (finalR > MAX_FWD_PWM) finalR = MAX_FWD_PWM;
-    } else {
-      if (finalL > 0) finalL = 0;
-      if (finalR > 0) finalR = 0;
-      if (finalL < -MAX_REV_PWM) finalL = -MAX_REV_PWM;
-      if (finalR < -MAX_REV_PWM) finalR = -MAX_REV_PWM;
-    }
-
-#if DEBUG
-    static unsigned long lastDbg = 0;
-    unsigned long now = millis();
-    if (now - lastDbg >= (unsigned long)PRINT_MS) {
-      lastDbg = now;
-
-      float dLma = (filled > 0) ? (float)sumL / (float)filled : 0.0f;
-      float dRma = (filled > 0) ? (float)sumR / (float)filled : 0.0f;
-
-      Serial.print(F("dist="));
-      Serial.print(distFilteredCm, 2);
-      Serial.print(F(" cm  base="));
-      Serial.print(baseCmdPWM);
-
-      Serial.print(F("  dL5="));
-      Serial.print(dLma, 2);
-      Serial.print(F("  dR5="));
-      Serial.print(dRma, 2);
-
-      Serial.print(F("  rel="));
-      Serial.print(rel, 4);
-
-      Serial.print(F("  pwmL="));
-      Serial.print(finalL);
-      Serial.print(F("  pwmR="));
-      Serial.print(finalR);
-
-      Serial.print(F("  lost="));
-      Serial.print(lostTargetCount);
-
-      Serial.print(F("  brake="));
-      Serial.println(brakeActive);
-    }
-#endif
-  }
-
-  setMotorSignedPWM(finalL, finalR);
-}
-
-/* =============================== Setup =============================== */
+/* ===================== Setup ===================== */
 void setup() {
   delay(2000);
 
 #if DEBUG
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n=== Ultrasonic PID + K-Ratio Balance (reverse-fixed) ==="));
+
+  Serial.println(F("\n=== 3 Ultrasonic Latch Turn Code ==="));
+
+#if ENABLE_FORWARD_BACKWARD
+  Serial.println(F("MODE: front distance following ENABLED"));
+#else
+  Serial.println(F("MODE: forward/backward disabled. Testing side turns only."));
+#endif
+
+#if DEBUG_SENSORS
+  Serial.println(F("DEBUG_SENSORS: ON"));
+#else
+  Serial.println(F("DEBUG_SENSORS: OFF"));
+#endif
+
+#if DEBUG_ACTIONS
+  Serial.println(F("DEBUG_ACTIONS: ON"));
+#else
+  Serial.println(F("DEBUG_ACTIONS: OFF"));
+#endif
+
 #endif
 
   pinMode(ENA, OUTPUT);
   pinMode(ENB, OUTPUT);
+
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT);
   pinMode(IN4, OUTPUT);
 
-  pinMode(US_TRIG, OUTPUT);
-  pinMode(US_ECHO, INPUT);
-  digitalWrite(US_TRIG, LOW);
+  pinMode(US_FRONT_TRIG, OUTPUT);
+  pinMode(US_FRONT_ECHO, INPUT);
+  digitalWrite(US_FRONT_TRIG, LOW);
+
+  pinMode(US_LEFT_TRIG, OUTPUT);
+  pinMode(US_LEFT_ECHO, INPUT);
+  digitalWrite(US_LEFT_TRIG, LOW);
+
+  pinMode(US_RIGHT_TRIG, OUTPUT);
+  pinMode(US_RIGHT_ECHO, INPUT);
+  digitalWrite(US_RIGHT_TRIG, LOW);
 
   pinMode(ENC_L_A, INPUT_PULLUP);
   pinMode(ENC_L_B, INPUT_PULLUP);
@@ -595,44 +605,9 @@ void setup() {
     -MAX_REV_PWM,
     MAX_FWD_PWM
   );
-
-#if DEBUG
-  Serial.print(F("ticks/m = "));
-  Serial.println(ticksPerMeter());
-
-  Serial.print(F("Distance setpoint (cm) = "));
-  Serial.println(DIST_SET_CM);
-
-  Serial.print(F("Reverse threshold (cm) = "));
-  Serial.println(DIST_REVERSE_AT_CM);
-
-  Serial.print(F("Distance deadband (cm) = "));
-  Serial.println(DIST_DEADBAND_CM);
-
-  Serial.print(F("Forward/Reverse max PWM = "));
-  Serial.print(MAX_FWD_PWM);
-  Serial.print(F(" / "));
-  Serial.println(MAX_REV_PWM);
-
-  Serial.print(F("MIN_PWM_MOVE = "));
-  Serial.println(MIN_PWM_MOVE);
-
-  Serial.print(F("K_RATIO = "));
-  Serial.println(K_RATIO);
-
-  Serial.print(F("Brake PWM / Time = "));
-  Serial.print(BRAKE_PWM);
-  Serial.print(F(" / "));
-  Serial.println(BRAKE_TIME_MS);
-
-  Serial.print(F("Reverse kick PWM / Time = "));
-  Serial.print(REVERSE_KICK_PWM);
-  Serial.print(F(" / "));
-  Serial.println(REVERSE_KICK_MS);
-#endif
 }
 
-/* ================================ Main ================================ */
+/* ===================== Main Loop ===================== */
 void loop() {
   static unsigned long lastCtrlMs = 0;
   unsigned long now = millis();
@@ -653,7 +628,15 @@ void loop() {
     float dt = (now - lastCtrlMs) / 1000.0f;
     lastCtrlMs = now;
 
+    if (acquireFrontFromSideSensors()) {
+      return;
+    }
+
+#if ENABLE_FORWARD_BACKWARD
     updateDistanceControl(dt);
-    updateStraightBalanceAndDrive();
+    setMotorSignedPWM(baseCmdPWM, baseCmdPWM);
+#else
+    stopMotors();
+#endif
   }
 }
