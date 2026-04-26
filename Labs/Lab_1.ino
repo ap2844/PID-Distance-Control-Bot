@@ -16,7 +16,7 @@
 #define ENB 15
 #define IN1 4
 #define IN2 5
-#define IN3 2
+#define IN3 0
 #define IN4 3
 
 // ===== Encoder pins =====
